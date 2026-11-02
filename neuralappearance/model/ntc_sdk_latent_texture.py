@@ -24,6 +24,10 @@ class NtcSdkLatentTexture(NtcLatentTexture):
         # Per material: `num_latents` scales then `num_latents` biases, applied
         # after the HLG decode. Identity until a checkpoint provides them.
         self.output_affine: list[float] = []
+        # Pipeline ablation only (`rtcnam/harness/posthoc_ablation.py`): decode
+        # at the continuous uv instead of at one texel. Off unless a
+        # checkpoint sets it.
+        self.continuous_decode = False
 
     def _default_output_affine(self) -> list[float]:
         num_materials = len(self.material_texture_resolution)
@@ -53,11 +57,12 @@ class NtcSdkLatentTexture(NtcLatentTexture):
         # Training-only field of the joint route's grid; the SDK decode has none.
         del data['quant_noise_widths']
         data['output_affine'] = self.output_affine_gpu.storage.descriptor_handle_ro
+        data['continuous_decode'] = int(self.continuous_decode)
         return data
 
     def save_checkpoint_params(self, desc: list[str]) -> list[tuple[list[str], dict]]:
         params = super().save_checkpoint_params(desc)
-        params.append((desc, {'output_affine': self.output_affine}))
+        params.append((desc, {'output_affine': self.output_affine, 'continuous_decode': self.continuous_decode}))
         return params
 
     def load_checkpoint_params(self, params: dict) -> None:
@@ -67,4 +72,5 @@ class NtcSdkLatentTexture(NtcLatentTexture):
         if len(affine) != expected:
             raise ValueError(f'output_affine has {len(affine)} values, expected {expected}.')
         self.output_affine = affine
+        self.continuous_decode = bool(params.get('continuous_decode', False))
         self._upload_output_affine()

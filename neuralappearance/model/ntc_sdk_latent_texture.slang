@@ -23,6 +23,10 @@ __exported import util.texture_helpers;
 // - All octaves are always active (no mip fade) and each decoded channel goes
 //   through RTXNTC's HLG decode, then the per-channel affine that undoes the
 //   [0, 1] normalization applied before compression.
+// - `continuous_decode` (pipeline ablation only, off by default) makes the
+//   stochastic lookup decode at the continuous uv instead: grids sampled at
+//   uv and the positional encoding at the continuous texel position. ntc-cli
+//   never trained there, so this measures what decoding at texels buys.
 struct NtcSdkLatentTexture<
     int NumTiles,
     int NumMipLevels,
@@ -38,6 +42,7 @@ struct NtcSdkLatentTexture<
     StructuredBuffer<int>.Handle material_texture_resolution;
     // Per material: NumLatents scales followed by NumLatents biases.
     StructuredBuffer<float>.Handle output_affine;
+    int continuous_decode;
     Texture<NumFeatures> high_res_grids[NumTiles * NumMipLevels];
     Texture<NumFeatures> low_res_grids[NumTiles * NumMipLevels];
     Decoder decoder;
@@ -87,6 +92,11 @@ struct NtcSdkLatentTexture<
     {
         let color_resolution = get_color_resolution(input.material_id, input.mip_level);
         let wrap = get_material_wrap(input.material_id);
+        if (continuous_decode != 0)
+        {
+            let local_uv = wrap ? (input.uv - no_diff floor(input.uv)) : clamp(input.uv, 0.f, 1.f);
+            return decode_at(input, local_uv, local_uv * float(color_resolution) - 0.5f, color_resolution);
+        }
         let texel = stochastic_texel(input.uv, color_resolution, wrap, sample);
         return decode_texel(input, texel, color_resolution);
     }
@@ -94,19 +104,27 @@ struct NtcSdkLatentTexture<
     [Differentiable]
     float[NumLatents] decode_texel(LatentTextureInput input, int2 texel, int color_resolution)
     {
+        let uv_center = (float2(texel) + 0.5f) / float(color_resolution);
+        return decode_at(input, uv_center, float2(texel), color_resolution);
+    }
+
+    // `texel_pos` is in color-texture texels: the integer index at a texel
+    // center, fractional for a continuous decode.
+    [Differentiable]
+    float[NumLatents] decode_at(LatentTextureInput input, float2 grid_uv, float2 texel_pos, int color_resolution)
+    {
         let udim_idx = get_udim_index(input.material_id, input.uv);
         let tile_idx = get_tile_idx(input.material_id, udim_idx);
         let grid_idx = get_grid_idx(tile_idx, input.mip_level);
 
-        let uv_center = (float2(texel) + 0.5f) / float(color_resolution);
-        float[NumFeatures] hi = high_res_grids[grid_idx].get_bilinear(uv_center);
-        float[NumFeatures] lo = low_res_grids[grid_idx].get_bilinear(uv_center);
+        float[NumFeatures] hi = high_res_grids[grid_idx].get_bilinear(grid_uv);
+        float[NumFeatures] lo = low_res_grids[grid_idx].get_bilinear(grid_uv);
 
         // RTXNTC (TextureSet.cpp): positionScale = 0.5 * gridWidth / colorMipWidth,
         // positionLod = clamp(0.25 * log2(positionScale), -1, 1).
         let position_scale = get_position_scale(grid_idx, color_resolution);
         let lod = clamp(0.25f * log2(position_scale), -1.f, 1.f);
-        float[4 * NumPosEncWaves] pos_enc = encode_texel_position<NumPosEncWaves>(float2(texel) * position_scale);
+        float[4 * NumPosEncWaves] pos_enc = encode_texel_position<NumPosEncWaves>(texel_pos * position_scale);
 
         float[DecoderInputWidth] decoder_input;
         int idx = 0;
